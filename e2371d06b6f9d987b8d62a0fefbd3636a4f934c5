@@ -1,0 +1,13 @@
+{
+  "event": "security_override",
+  "timestamp": "2026-07-31T15:05:49.507274+00:00",
+  "user": "joao.renner@incognia.com",
+  "branch": "renner_upgrade-dependencies-and-base-image",
+  "files": [
+    "package-lock.json"
+  ],
+  "detectors": [
+    "Gitleaks: incognia-api-credentials"
+  ],
+  "secrets_found": 4
+}

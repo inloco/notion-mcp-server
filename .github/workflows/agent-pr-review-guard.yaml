@@ -1,13 +1,16 @@
 name: Agent PR Review Guard
+
 on:
+  pull_request:
+    types: [opened, reopened, synchronize]
   pull_request_review:
     types: [submitted, dismissed]
   merge_group:
     types: [checks_requested]
 
 permissions:
-  contents: read
   pull-requests: read
+  statuses: write
 
 concurrency:
   group: agent-pr-review-guard-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
@@ -15,72 +18,89 @@ concurrency:
 
 jobs:
   evaluate:
-    name: Agent PR Review Guard
-    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+
     steps:
-      - name: Check human approvals
+      - name: Evaluate
+        if: github.event_name != 'merge_group'
+        id: evaluate
         uses: actions/github-script@v8
         with:
           script: |
-              const { owner, repo } = context.repo;
-              const agentIds = [333783168];
-              const sha = context.payload.pull_request.head.sha;
+            function isAgent(id) {
+              const agentIds = [
+                333783168
+              ];
+              return agentIds.includes(id);
+            }
 
-              async function agentPullRequestFromEvent() {
-                const { data: pr } = await github.rest.pulls.get({
-                  owner, repo, pull_number: context.payload.pull_request.number,
-                });
-                if (pr.head.sha !== sha) {
-                  throw new Error('The PR head changed; wait for the latest review check.');
+            async function isAgentPR(owner, repo, pull_number) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: context.payload.pull_request.number,
+              });
+              return isAgent(pr.user.id);
+            }
+
+            async function canApprove(owner, repo, user) {
+              if (isAgent(user.id)) return false;
+
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner, repo, username: user.login,
+              });
+              return ['admin', 'maintain', 'write'].includes(data.permission);
+            }
+
+            async function reviewCount(owner, repo, pull_number) {
+              const reviews = await github.paginate(
+                github.rest.pulls.listReviews,
+                { owner, repo, pull_number, per_page: 100 }
+              );
+
+              const latestReviews = new Map();
+
+              for (const review of reviews) {
+                if (review.state === "COMMENTED") continue;
+
+                if (!review.user) continue;
+                const user = review.user;
+                if (!await canApprove(owner, repo, user)) continue;
+
+                if (!review.submitted_at) continue;
+                const previous = latestReviews.get(user.id);
+                if (
+                  !previous ||
+                  new Date(review.submitted_at) >= new Date(previous.submitted_at)
+                ) {
+                  latestReviews.set(user.id, review);
                 }
-                return agentIds.includes(pr.user.id) ? pr : null;
               }
 
-              async function canApprove(login) {
-                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
-                  owner, repo, username: login,
-                });
-                return ['admin', 'maintain', 'write'].includes(data.permission);
-              }
+              return [...latestReviews.values()]
+                .filter(review => review.state === "APPROVED")
+                .length;
+            }
 
-              async function latestReviewsByUser(pr) {
-                const reviews = await github.paginate(github.rest.pulls.listReviews, {
-                  owner, repo, pull_number: pr.number, per_page: 100,
-                });
-                const latestReviews = new Map();
-                for (const review of reviews.sort((a, b) => a.id - b.id)) {
-                  if (!review.user || ['COMMENTED', 'PENDING'].includes(review.state)) {
-                    continue;
-                  }
-                  latestReviews.set(review.user.id, review);
-                }
-                return latestReviews;
-              }
 
-              async function humanApprovalCount(pr) {
-                const latestReviews = await latestReviewsByUser(pr);
-                let approvals = 0;
-                for (const review of latestReviews.values()) {
-                  if (review.state !== 'APPROVED' || review.commit_id !== pr.head.sha ||
-                      review.user.type !== 'User' || review.user.id === pr.user.id) {
-                    continue;
-                  }
-                  if (await canApprove(review.user.login)) {
-                    approvals++;
-                  }
-                }
-                return approvals;
-              }
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            ok = !await isAgentPR(owner, repo, pull_number) || await reviewCount(owner, repo, pull_number) >= 2
 
-              const pr = await agentPullRequestFromEvent();
-              if (!pr) {
-                return;
-              }
+            core.setOutput("ok", ok);
 
-              const count = await humanApprovalCount(pr);
-              core.info(`PR #${pr.number}: ${count}/2 human approvals for ${pr.head.sha}`);
-              if (count < 2) {
-                core.setFailed(`At least 2 human approvals required on PR #${pr.number}.`);
-              }
+      - name: Set commit status
+        uses: actions/github-script@v8
+        env:
+          IS_OK: ${{ github.event_name == 'merge_group' || steps.evaluate.outputs.ok }}
+        with:
+          script: |
+            const ok = process.env.IS_OK == "true";
+
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: context.eventName === "merge_group"
+                ? context.payload.merge_group.head_sha
+                : context.payload.pull_request.head.sha,
+              state: ok ? "success" : "pending",
+              context: "Agent PR Review Guard",
+              description: "Agent PRs require 2 approvals to merge"
+            });
